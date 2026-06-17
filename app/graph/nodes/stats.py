@@ -4,9 +4,11 @@ Reached when state["ready_for_stats"] is True (stats intent detected in orchestr
 Uses the GENERATOR model to extract a query spec, builds a safe JQL, runs a read-only
 search, aggregates counts + story points, and formats a report. No writes ever.
 """
+import ast
 import datetime
 import json
 import logging
+import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
@@ -19,6 +21,92 @@ from app.llm.registry import ModelRole, get_model
 from app.prompts.stats import STATS_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+# ── Function-call fallback parser ────────────────────────────────────────────
+# Some LLMs (e.g. gemma-4-31b-it) output <FunctionCall>...</FunctionCall> instead
+# of raw JSON even when instructed otherwise.  This regex matches the wrapper so
+# we can attempt to reconstruct a valid spec from the inner content.
+_FC_OUTER_RE = re.compile(
+    r"<function_?calls?\b[^>]*>(.*?)</function_?calls?>",
+    re.DOTALL | re.IGNORECASE,
+)
+# Dash variants used as CLI-flag prefixes: ASCII hyphen, en-dash, em-dash
+_DASH_RE = r"[-–—]+"
+
+
+def _parse_function_call_to_spec(raw: str) -> Optional[Dict[str, Any]]:
+    """Attempt to build a stats spec from an LLM <FunctionCall> output.
+
+    Handles the case where the model wraps a Python-dict function call instead of
+    returning a plain JSON object.  Returns None when the format is unrecognised.
+    """
+    m = _FC_OUTER_RE.search(raw)
+    inner = m.group(1).strip() if m else raw.strip()
+
+    # Parse the Python dict with single-quoted keys/values safely via ast.
+    try:
+        parsed = ast.literal_eval(inner)
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    args_str = str(parsed.get("args", ""))
+    if not args_str:
+        return None
+
+    spec: Dict[str, Any] = {"query_type": "issues"}
+
+    # --projectKey / –projectKey
+    mp = re.search(_DASH_RE + r"projectKey\s+[\"']?([A-Z][A-Z0-9_]+)[\"']?", args_str)
+    if mp:
+        spec["project_key"] = mp.group(1)
+
+    # --search / –search  (contains a JQL string)
+    ms = re.search(_DASH_RE + r'search\s+["\']([^"\']+)["\']', args_str)
+    jql = ms.group(1) if ms else ""
+
+    if jql:
+        # assignee
+        ma = re.search(r"assignee\s*=\s*[\"']?(\w+)[\"']?", jql, re.IGNORECASE)
+        if ma:
+            spec["assignee"] = ma.group(1)
+
+        # completion / status
+        if re.search(r"status(?:Category)?\s*[=\s]+[\"']?done[\"']?", jql, re.IGNORECASE):
+            spec["completed_only"] = True
+
+        # resolved date range
+        mdf = re.search(r"resolved\s*>=\s*[\"']?(\d{4}-\d{2}-\d{2})[\"']?", jql, re.IGNORECASE)
+        if mdf:
+            spec["date_from"] = mdf.group(1)
+            spec["date_field"] = "resolved"
+        mdt = re.search(r"resolved\s*<=\s*[\"']?(\d{4}-\d{2}-\d{2})[\"']?", jql, re.IGNORECASE)
+        if mdt:
+            spec["date_to"] = mdt.group(1)
+
+        # created date range (fallback when no resolved)
+        if not spec.get("date_field"):
+            mcdf = re.search(r"created\s*>=\s*[\"']?(\d{4}-\d{2}-\d{2})[\"']?", jql, re.IGNORECASE)
+            if mcdf:
+                spec["date_from"] = mcdf.group(1)
+                spec["date_field"] = "created"
+            mcdt = re.search(r"created\s*<=\s*[\"']?(\d{4}-\d{2}-\d{2})[\"']?", jql, re.IGNORECASE)
+            if mcdt:
+                spec["date_to"] = mcdt.group(1)
+
+        # issue types
+        mtype_in = re.search(r"issuetype\s+in\s*\(([^)]+)\)", jql, re.IGNORECASE)
+        if mtype_in:
+            spec["issue_types"] = [t.strip().strip("\"'") for t in mtype_in.group(1).split(",") if t.strip()]
+        else:
+            mtype_eq = re.search(r"issuetype\s*=\s*[\"']?(\w+)[\"']?", jql, re.IGNORECASE)
+            if mtype_eq:
+                spec["issue_types"] = [mtype_eq.group(1)]
+
+    return spec if len(spec) > 1 else None  # at least one meaningful field beyond query_type
 
 
 # ── JQL builder (pure, testable) ──────────────────────────────────────────────
@@ -191,6 +279,26 @@ def _format_members_report(project_key: str, members: List[Dict[str, Any]]) -> s
     return "\n".join(lines)
 
 
+def _format_lead_report(project_key: str, info: Dict[str, Any]) -> str:
+    lead = info.get("lead")
+    admins: List[str] = info.get("admin_names") or []
+
+    lines = [f"🏷️ **Project Lead & Admin — `{project_key}`**", ""]
+    if lead:
+        lines.append(f"**Project Lead:** `{lead}`")
+    else:
+        lines.append("**Project Lead:** _(không tìm thấy hoặc chưa được cấu hình)_")
+
+    if admins:
+        lines.append(f"\n**Administrators** ({len(admins)} người):")
+        for name in sorted(admins):
+            lines.append(f"  - `{name}`")
+    else:
+        lines.append("\n**Administrators:** _(không có hoặc bot chưa có quyền xem)_")
+
+    return "\n".join(lines)
+
+
 # ── Node ──────────────────────────────────────────────────────────────────────
 
 async def stats_node(state: AgentState) -> Dict[str, Any]:
@@ -221,7 +329,19 @@ async def stats_node(state: AgentState) -> Dict[str, Any]:
                 {"role": "user", "content": user_prompt},
             ],
         )
-        spec = _extract_json(response.choices[0].message.content or "{}")
+        raw_llm = response.choices[0].message.content or "{}"
+        spec = _extract_json(raw_llm)
+
+        if not spec:
+            # LLM may have output <FunctionCall> format instead of JSON — attempt recovery
+            if _FC_OUTER_RE.search(raw_llm) or "FunctionCall" in raw_llm:
+                logger.warning(
+                    "stats_node: LLM returned function-call format instead of JSON spec "
+                    "(first 300 chars): %s", raw_llm[:300]
+                )
+                spec = _parse_function_call_to_spec(raw_llm) or {}
+                if spec:
+                    logger.info("stats_node: recovered spec from function-call fallback: %s", spec)
     except Exception as exc:
         logger.error("Stats LLM failed: %s", exc, exc_info=True)
         reply = "Xin lỗi, không thể xử lý yêu cầu thống kê lúc này. Vui lòng thử lại."
@@ -250,7 +370,27 @@ async def stats_node(state: AgentState) -> Dict[str, Any]:
             )
             return {**state, "messages": [*messages, {"role": "assistant", "content": reply}], **reset}
 
-    # ── 2a. Members query ─────────────────────────────────────────────────────
+    # ── 2a. Lead / Admin query ────────────────────────────────────────────────
+    if query_type == "lead":
+        if not project_key:
+            reply = "⚠️ Bạn cho mình biết **mã project** (ví dụ: EWL, PCFBANK) để mình tìm Project Lead nhé."
+            return {**state, "messages": [*messages, {"role": "assistant", "content": reply}], **reset}
+
+        if settings.use_mock_jira:
+            reply = f"📋 (mock mode) Sẽ gọi GET /rest/api/2/project/{project_key} để lấy Project Lead & Admins."
+            return {**state, "messages": [*messages, {"role": "assistant", "content": reply}], **reset}
+
+        from app.integrations.jira.client import get_jira_client
+        jira = get_jira_client()
+        try:
+            info = await jira.get_project_lead_and_admins(project_key)
+            reply = _format_lead_report(project_key, info)
+        except Exception as exc:
+            logger.error("Stats lead query failed: %s", exc, exc_info=True)
+            reply = f"⚠️ Không thể lấy thông tin Project Lead: {exc}"
+        return {**state, "messages": [*messages, {"role": "assistant", "content": reply}], **reset}
+
+    # ── 2b. Members query ─────────────────────────────────────────────────────
     if query_type == "members":
         if not project_key:
             reply = "⚠️ Bạn cho mình biết **mã project** (ví dụ: EWL, PCFBANK) để mình lấy danh sách thành viên nhé."

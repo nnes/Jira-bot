@@ -151,7 +151,7 @@ _TOOL_CALL_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _FUNCTION_CALL_RE = re.compile(
-    r"<function_calls?>.*?</function_calls?>",
+    r"<function_?calls?\b[^>]*>.*?</function_?calls?>",
     re.DOTALL | re.IGNORECASE,
 )
 

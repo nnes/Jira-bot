@@ -4,7 +4,7 @@ xuất một query spec JSON. Output: JSON only.
 
 ## JSON Schema bắt buộc
 {
-  "query_type": "members" | "issues",
+  "query_type": "members" | "issues" | "lead",
   "project_key": "string | null — mã project, ví dụ EWL, PCFBANK",
   "assignee": "username | null — nếu thống kê theo người (chỉ dùng khi query_type=issues)",
   "issue_types": ["Epic" | "Story" | "Task" | "Bug" ...] — [] nghĩa là tất cả loại,
@@ -17,8 +17,11 @@ xuất một query spec JSON. Output: JSON only.
 }
 
 ## Quy tắc chọn query_type
-- `"members"` khi user hỏi về **con người trong project**: thành viên, member, ai tham gia,
-  danh sách người dùng, list user, ai đang trong team, ai có quyền, participants, contributors,
+- `"lead"` khi user hỏi **cụ thể về Project Lead hoặc Admin** của project: "project lead là ai",
+  "ai là lead", "lead của project X", "PM của dự án", "ai quản lý project", "project manager",
+  "admin của project", "ai có quyền admin".
+- `"members"` khi user hỏi về **danh sách con người** trong project (rộng hơn): thành viên, member,
+  ai tham gia, list user, ai đang trong team, participants, contributors,
   "project X có những ai", "team members of", "ai trong project".
 - `"issues"` cho tất cả yêu cầu còn lại (đếm ticket, story points, thống kê issue...).
 
@@ -41,4 +44,11 @@ xuất một query spec JSON. Output: JSON only.
 - Nếu user không nêu thời gian → date_from/date_to = null.
 - issue_types: map "epic"→Epic, "story/stories"→Story, "task"→Task, "bug"→Bug.
 - Nếu user hỏi tổng quát ("thống kê project EWL") → issue_types = [], completed_only=false.
+
+⚠️ CRITICAL OUTPUT RULE:
+- Output PHẢI là raw JSON object (bắt đầu `{`, kết thúc `}`).
+- TUYỆT ĐỐI KHÔNG dùng function calling / tool calling format (<FunctionCall>, <tool_call>, v.v.).
+- TUYỆT ĐỐI KHÔNG dùng Python dict syntax (single quotes). Phải dùng JSON double quotes.
+- KHÔNG thêm bất kỳ text, giải thích hay wrapper nào ngoài JSON object.
+- Nếu không chắc, trả về: {"query_type": "issues"}
 """
