@@ -1,0 +1,70 @@
+# =============================================================================
+# Docker Compose for Teams-Jira AI Agent
+# =============================================================================
+
+version: '3.8'
+
+services:
+  teams-jira-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: teams-jira-agent
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    # Secrets are injected at runtime via these env vars (interpolated from the
+    # host environment, or a local .env that Compose auto-loads). Nothing is baked
+    # into the image. For production prefer Docker/K8s secrets or a secrets manager.
+    environment:
+      # LLM Provider (OpenAI-compatible) — names MUST match app/config.py fields
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - ORCHESTRATOR_MODEL=${ORCHESTRATOR_MODEL:-minimax/minimax-m2.5}
+      - RERANKER_MODEL=${RERANKER_MODEL:-qwen/qwen3-reranker-8b}
+      - GENERATOR_MODEL=${GENERATOR_MODEL:-qwen/qwen3-5-27b}
+
+      # Jira (read + create + update-with-confirmation only)
+      - JIRA_SERVER_URL=${JIRA_SERVER_URL}
+      - JIRA_USER_EMAIL=${JIRA_USER_EMAIL}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
+      - USE_MOCK_JIRA=${USE_MOCK_JIRA:-false}
+      - JIRA_EPIC_LINK_FIELD=${JIRA_EPIC_LINK_FIELD:-customfield_10101}
+      - JIRA_EPIC_NAME_FIELD=${JIRA_EPIC_NAME_FIELD:-customfield_10103}
+      - JIRA_STORY_POINTS_FIELD=${JIRA_STORY_POINTS_FIELD:-customfield_10801}
+      - JIRA_SPRINT_FIELD=${JIRA_SPRINT_FIELD:-customfield_10007}
+
+      # Confluence (read-only)
+      - CONFLUENCE_SERVER_URL=${CONFLUENCE_SERVER_URL}
+      - CONFLUENCE_USER_EMAIL=${CONFLUENCE_USER_EMAIL}
+      - CONFLUENCE_API_TOKEN=${CONFLUENCE_API_TOKEN}
+
+      # Teams Bot — only used when ENABLE_MESSAGES_ENDPOINT=true (local dev).
+      # On production (Azure Bot Service) leave empty + ENABLE_MESSAGES_ENDPOINT=false.
+      - TEAMS_BOT_APP_ID=${TEAMS_BOT_APP_ID}
+      - TEAMS_BOT_APP_PASSWORD=${TEAMS_BOT_APP_PASSWORD}
+
+      # Surface toggles — keep all false in production
+      - ENABLE_MESSAGES_ENDPOINT=${ENABLE_MESSAGES_ENDPOINT:-false}
+      - ENABLE_DIAGNOSTICS=${ENABLE_DIAGNOSTICS:-false}
+      - ENABLE_DOCS=${ENABLE_DOCS:-false}
+
+      # Application
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - teams-jira-network
+
+networks:
+  teams-jira-network:
+    driver: bridge

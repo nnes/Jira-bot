@@ -1,0 +1,1 @@
+https://github.com/vngcloud/greennode-agentbase-skills

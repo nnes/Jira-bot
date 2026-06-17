@@ -1,0 +1,26 @@
+.agentbase/
+
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# AgentBase platform state & local machine settings (not for sharing)
+.agentbase-state.json
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+.greennode.json
